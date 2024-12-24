@@ -1,4 +1,4 @@
-import {Project, ResolveOptions, ThrowReport, Resolver, miscUtils, Descriptor, Package, Report, Cache, DescriptorHash} from '@yarnpkg/core';
+import {Project, ResolveOptions, ThrowReport, Resolver, miscUtils, Descriptor, Package, Report, Cache, DescriptorHash, Configuration} from '@yarnpkg/core';
 import {formatUtils, structUtils, IdentHash, LocatorHash, MessageName, Fetcher, FetchOptions}                          from '@yarnpkg/core';
 import micromatch                                                                                                      from 'micromatch';
 
@@ -25,6 +25,14 @@ export enum Strategy {
    * - dependencies are never downgraded
    */
   HIGHEST = `highest`,
+
+  /**
+   * This strategy dedupes a locator to a version that fits a range specified
+   * directly in package.json. Otherwise, it's the same as highest.
+   *
+   * This means that transitive dependencies may be downgraded.
+   */
+  DIRECT = `direct`,
 }
 
 export const acceptedStrategies = new Set(Object.values(Strategy));
@@ -108,6 +116,168 @@ const DEDUPE_ALGORITHMS: Record<Strategy, Algorithm> = {
         });
 
         const satisfying = await resolver.getSatisfying(descriptor, resolvedDependencies, candidates, resolveOptions);
+
+        const bestLocator = satisfying.locators?.[0];
+        if (typeof bestLocator === `undefined` || !satisfying.sorted)
+          return currentPackage;
+
+        const updatedPackage = project.originalPackages.get(bestLocator.locatorHash);
+        if (typeof updatedPackage === `undefined`)
+          throw new Error(`Assertion failed: The package (${bestLocator.locatorHash}) should have been registered`);
+
+        return updatedPackage;
+      }).then(async updatedPackage => {
+        const resolvedPackage = await project.preparePackage(updatedPackage, {resolver, resolveOptions});
+
+        deferred.resolve({
+          descriptor,
+          currentPackage,
+          updatedPackage,
+          resolvedPackage,
+        });
+      }).catch(error => {
+        deferred.reject(error);
+      });
+    }
+
+    return [...deferredMap.values()].map(deferred => {
+      return deferred.promise;
+    });
+  },
+  direct: async (project, patterns, {resolver, fetcher, resolveOptions, fetchOptions}) => {
+    const locatorsByIdent = new Map<IdentHash, Set<LocatorHash>>();
+    for (const [descriptorHash, locatorHash] of project.storedResolutions) {
+      const descriptor = project.storedDescriptors.get(descriptorHash);
+      if (typeof descriptor === `undefined`)
+        throw new Error(`Assertion failed: The descriptor (${descriptorHash}) should have been registered`);
+
+      miscUtils.getSetWithDefault(locatorsByIdent, descriptor.identHash).add(locatorHash);
+    }
+
+    // resolve the "best" candidate for direct dependencies (ones in package.json)
+    const directLocatorsByIdent = new Map<IdentHash, Set<LocatorHash>>();
+    for (const workspace of project.workspaces) {
+      const addIdents = async (deps: Map<IdentHash, Descriptor>) => {
+        const normalizedMap = project.configuration.normalizeDependencyMap(deps);
+        for (const descriptor of normalizedMap.values()) {
+          const locators = locatorsByIdent.get(descriptor.identHash);
+          if (typeof locators === `undefined`)
+            throw new Error(`Assertion failed: The resolutions (${descriptor.identHash}) should have been registered`);
+
+          const references = [...locators].map(locatorHash => {
+            const pkg = project.originalPackages.get(locatorHash);
+            if (typeof pkg === `undefined`)
+              throw new Error(`Assertion failed: The package (${locatorHash}) should have been registered`);
+
+            return pkg;
+          });
+
+          try {
+            // some resolvers (like the patch resolver) will throw if we don't
+            // provide the resolved dependencies but we don't really care about
+            // them
+            const satisfying = await resolver.getSatisfying(descriptor, {}, references, resolveOptions);
+
+            // if there are no results or the result list is not sorted we
+            // can't know the actual "best" candidate
+            if (satisfying.locators.length === 0 || !satisfying.sorted) {
+              continue;
+            }
+
+            const bestCandidate = satisfying.locators[0];
+            miscUtils.getSetWithDefault(directLocatorsByIdent, descriptor.identHash).add(bestCandidate.locatorHash);
+          } catch {}
+        }
+      };
+
+      await addIdents(workspace.manifest.dependencies);
+      await addIdents(workspace.manifest.devDependencies);
+    }
+
+
+    const deferredMap = new Map<DescriptorHash, miscUtils.Deferred<PackageUpdate>>(
+      miscUtils.mapAndFilter(project.storedDescriptors.values(), descriptor => {
+        // We only care about resolutions that are stored in the lockfile
+        // (we shouldn't accidentally try deduping virtual packages)
+        if (structUtils.isVirtualDescriptor(descriptor))
+          return miscUtils.mapAndFilter.skip;
+
+        return [descriptor.descriptorHash, miscUtils.makeDeferred()];
+      }),
+    );
+
+    for (const descriptor of project.storedDescriptors.values()) {
+      const deferred = deferredMap.get(descriptor.descriptorHash);
+      if (typeof deferred === `undefined`)
+        throw new Error(`Assertion failed: The descriptor (${descriptor.descriptorHash}) should have been registered`);
+
+      const currentResolution = project.storedResolutions.get(descriptor.descriptorHash);
+      if (typeof currentResolution === `undefined`)
+        throw new Error(`Assertion failed: The resolution (${descriptor.descriptorHash}) should have been registered`);
+
+      const currentPackage = project.originalPackages.get(currentResolution);
+      if (typeof currentPackage === `undefined`)
+        throw new Error(`Assertion failed: The package (${currentResolution}) should have been registered`);
+
+      Promise.resolve().then(async () => {
+        const dependencies = resolver.getResolutionDependencies(descriptor, resolveOptions);
+
+        const resolvedDependencies = Object.fromEntries(
+          await miscUtils.allSettledSafe(
+            Object.entries(dependencies).map(async ([dependencyName, dependency]) => {
+              const dependencyDeferred = deferredMap.get(dependency.descriptorHash);
+              if (typeof dependencyDeferred === `undefined`)
+                throw new Error(`Assertion failed: The descriptor (${dependency.descriptorHash}) should have been registered`);
+
+              const dedupeResult = await dependencyDeferred.promise;
+              if (!dedupeResult)
+                throw new Error(`Assertion failed: Expected the dependency to have been through the dedupe process itself`);
+
+              return [dependencyName, dedupeResult.updatedPackage];
+            }),
+          ),
+        );
+
+        if (patterns.length && !micromatch.isMatch(structUtils.stringifyIdent(descriptor), patterns))
+          return currentPackage;
+
+        // No need to try deduping packages that are not persisted,
+        // they will be resolved again anyways
+        if (!resolver.shouldPersistResolution(currentPackage, resolveOptions))
+          return currentPackage;
+
+        const candidateHashes = locatorsByIdent.get(descriptor.identHash);
+        if (typeof candidateHashes === `undefined`)
+          throw new Error(`Assertion failed: The resolutions (${descriptor.identHash}) should have been registered`);
+
+        // No need to choose when there's only one possibility
+        if (candidateHashes.size === 1)
+          return currentPackage;
+
+        const candidates = [...candidateHashes].map(locatorHash => {
+          const pkg = project.originalPackages.get(locatorHash);
+          if (typeof pkg === `undefined`)
+            throw new Error(`Assertion failed: The package (${locatorHash}) should have been registered`);
+
+          return pkg;
+        });
+
+        let satisfying = await resolver.getSatisfying(descriptor, resolvedDependencies, candidates, resolveOptions);
+
+        const directLocators = directLocatorsByIdent.get(descriptor.identHash);
+
+        // If this ident is of a direct dependency, use only the candidates those
+        // direct dependencies will use. If this results in no candidates, use
+        // all candidates.
+        if (typeof directLocators !== `undefined` && candidates !== null) {
+          const filteredLocators = satisfying.locators.filter(locator => directLocators.has(locator.locatorHash));
+          if (filteredLocators.length > 0) {
+            satisfying = {
+              locators: filteredLocators,
+              sorted: satisfying.sorted,
+            };
+          }
+        }
 
         const bestLocator = satisfying.locators?.[0];
         if (typeof bestLocator === `undefined` || !satisfying.sorted)
